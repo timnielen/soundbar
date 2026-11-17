@@ -7,8 +7,6 @@
 
 
 uint8_t pdControllerStatus = 0;
-static volatile uint32_t swLeftLastEdge = 0;
-static volatile uint8_t  swLeftPending  = 0;
 
 
 #endif

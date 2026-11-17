@@ -49,6 +49,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Core/Src/biquad.c
     # Core/Src/soundbar_dsp.c
     Core/Src/pc_control.c
+    # Core/Src/chime.c
+    # Core/Src/sounds/error.c   (generated in code now)
+    Core/Src/sounds/switch_on.c
+    Core/Src/sounds/switch_off.c
 )
 
 # Add include paths

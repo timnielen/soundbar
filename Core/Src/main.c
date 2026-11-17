@@ -29,7 +29,10 @@
 #include "pc_control.h"
 #include "pd_controller.h"
 
+#include "sounds.h"
+
 #include "stm32g0xx_hal_def.h"
+#include "stm32g0xx_hal_i2s.h"
 
 /* USER CODE END Includes */
 
@@ -55,7 +58,6 @@ I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
 I2S_HandleTypeDef hi2s1;
-DMA_HandleTypeDef hdma_spi1_rx;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -67,7 +69,6 @@ UART_HandleTypeDef huart2;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_I2S1_Init(void);
@@ -233,6 +234,19 @@ HAL_StatusTypeDef tas_set_volume(uint8_t addr, uint8_t code) {
   return st;
 }
 
+#define VOL_MAX 0x00      /* +24 dB (loudest the TAS can do), clips above -24 dBFS */
+#define VOL_MIN 0xFC      /* -102 dB (last 2 dB step before mute 0xFF) */
+#define VOL_START 0x30    /* 0 dB at power-up                   */
+#define VOL_STEP 4        /* 2 dB per button press              */
+#define VOL_SOUND_MIN 0x6C /* sounds play at least at -30 dB    */
+static uint8_t vol_code = VOL_START;
+
+static HAL_StatusTypeDef tas_both_volume(uint8_t code) {
+  HAL_StatusTypeDef st = tas_set_volume(LEFT_TAS_ADDR, code);
+  st |= tas_set_volume(RIGHT_TAS_ADDR, code);
+  return st;
+}
+
 /* Everything that must happen while the I2S clock is stopped. */
 static HAL_StatusTypeDef tas_prepare(uint8_t addr) {
   HAL_StatusTypeDef st = tas_select(addr, TAS_BOOK_CTRL, 0x00);
@@ -375,6 +389,8 @@ static void tas_startup(void) {
   tas_equalizer(RIGHT_TAS_ADDR, TAS_PAGE_BQ_TWEETER, TAS_START_ADDR_BQ_TWEETER,
                 bq_tweeter, length_tweeter);
 
+  st |= tas_both_volume(vol_code); /* PDN reset it to 0 dB */
+
   st |= tas_select(LEFT_TAS_ADDR, TAS_BOOK_CTRL, 0x00);
   st |= tas_select(RIGHT_TAS_ADDR, TAS_BOOK_CTRL, 0x00);
   st |= tas_write(LEFT_TAS_ADDR, TAS_REG_CTRL_2, TAS_STATE_PLAY);
@@ -453,13 +469,222 @@ void tas_faults(uint8_t addr) {
   tas_write(addr, TAS_REG_FAULT_CLEAR, TAS_FAULT_CLEAR);
 }
 
+#define CHUNK_SRC 32                          // source samples per chunk
+static int16_t buf[CHUNK_SRC * 2 * 2];        // ×2 frames, ×2 channels = 256 bytes
+
+/* both amps: same state, page 0 / book 0 */
+static HAL_StatusTypeDef tas_both_state(uint8_t state) {
+  HAL_StatusTypeDef st = HAL_OK;
+  st |= tas_select(LEFT_TAS_ADDR, TAS_BOOK_CTRL, 0x00);
+  st |= tas_write(LEFT_TAS_ADDR, TAS_REG_CTRL_2, state);
+  st |= tas_select(RIGHT_TAS_ADDR, TAS_BOOK_CTRL, 0x00);
+  st |= tas_write(RIGHT_TAS_ADDR, TAS_REG_CTRL_2, state);
+  return st;
+}
+
+static HAL_StatusTypeDef tas_both_clear_faults(void) {
+  HAL_StatusTypeDef st = HAL_OK;
+  st |= tas_write(LEFT_TAS_ADDR, TAS_REG_FAULT_CLEAR, TAS_FAULT_CLEAR);
+  st |= tas_write(RIGHT_TAS_ADDR, TAS_REG_FAULT_CLEAR, TAS_FAULT_CLEAR);
+  return st;
+}
+
+/* send 'frames' frames of silence; starts the clocks on the first call */
+static void i2s_silence(I2S_HandleTypeDef *hi2s, size_t frames) {
+  for (size_t k = 0; k < sizeof(buf) / sizeof(buf[0]); k++)
+    buf[k] = 0;
+  size_t per_chunk = sizeof(buf) / sizeof(buf[0]) / 2;     // 64 frames
+  while (frames) {
+    size_t f = (frames < per_chunk) ? frames : per_chunk;
+    HAL_I2S_Transmit(hi2s, (uint16_t *)buf, f * 2, HAL_MAX_DELAY);
+    frames -= f;
+  }
+}
+
+static const int16_t sine_1k[32] = {
+  0, 1561, 3061, 4445, 5657, 6652, 7391, 7846,
+  8000, 7846, 7391, 6652, 5657, 4445, 3061, 1561,
+  0, -1561, -3061, -4445, -5657, -6652, -7391, -7846,
+  -8000, -7846, -7391, -6652, -5657, -4445, -3061, -1561
+};
+
+
+/* one 16-bit half-word to the I2S data register, as soon as there is room.
+ * The I2S must already be running (i2s_silence() enables it). */
+static inline void i2s_put(SPI_TypeDef *spi, int16_t s) {
+  while ((spi->SR & SPI_SR_TXE) == 0U) {
+  }
+  spi->DR = (uint16_t)s;
+}
+
+/* Streams a 16 kHz sound sample by sample instead of refilling a buffer
+ * between HAL_I2S_Transmit() calls: that refill took ~30 us at -O0, longer
+ * than one 15.5 us slot, so the transmitter ran dry every chunk. Here each
+ * sample is fetched while the previous one is still shifting out. */
+static void sound_stream(I2S_HandleTypeDef *hi2s, const int16_t *pcm, size_t n) {
+  SPI_TypeDef *spi = hi2s->Instance;
+  for (size_t j = 0; j < n; j++) {
+    int16_t s = pcm[j];
+    for (int r = 0; r < 2; r++) {             // 16 kHz -> 32 kHz
+      i2s_put(spi, s);                        // L
+      i2s_put(spi, s);                        // R
+    }
+  }
+}
+
+
+/* test tone: 'ms' milliseconds of 1 kHz on L and R */
+void sine_play(I2S_HandleTypeDef *hi2s, uint32_t ms) {
+  size_t frames_per_chunk = sizeof(buf) / sizeof(buf[0]) / 2;   // 64 frames = 2 periods
+  for (size_t k = 0; k < frames_per_chunk; k++) {
+    int16_t s = sine_1k[k % 32];
+    buf[2 * k]     = s;                    // L
+    buf[2 * k + 1] = s;                    // R
+  }
+  uint32_t chunks = ms * 32 / frames_per_chunk;                 // 32 frames per ms
+  for (uint32_t c = 0; c < chunks; c++)
+    HAL_I2S_Transmit(hi2s, (uint16_t *)buf, frames_per_chunk * 2, HAL_MAX_DELAY);
+}
+
+/* ADC + both amps on or off. Off = amps in deep sleep (I2C still works,
+ * so play_sound() can wake them), PCM1808 clocks stopped. */
+void audio_set(uint8_t on) {
+  if (on) {
+    start_adc();
+    HAL_Delay(20); /* oscillator + TAS lock */
+    tas_play(LEFT_TAS_ADDR);
+    tas_play(RIGHT_TAS_ADDR);
+    tas_both_clear_faults();
+  } else {
+    tas_deep_sleep(LEFT_TAS_ADDR);
+    tas_deep_sleep(RIGHT_TAS_ADDR);
+    stop_adc();
+  }
+}
+
+/* 'ms' milliseconds of 'hz' from the sine table (amplitude 8000 >> shift).
+ * Pick ms as whole periods of hz so the tone ends at a zero crossing. */
+static void tone_stream(I2S_HandleTypeDef *hi2s, uint32_t hz, uint32_t ms,
+                        uint8_t shift) {
+  SPI_TypeDef *spi = hi2s->Instance;
+  uint32_t step = (hz << 16) / 1000U; /* table index per frame, 16.16 */
+  uint32_t phase = 0;
+  for (uint32_t k = 0; k < ms * 32U; k++, phase += step) {
+    int16_t s = (int16_t)(sine_1k[(phase >> 16) & 31U] >> shift);
+    i2s_put(spi, s);                          // L
+    i2s_put(spi, s);                          // R
+  }
+}
+
+/* error: two short low beeps (replaces the 9.6 KB error.wav) */
+static void error_stream(I2S_HandleTypeDef *hi2s) {
+  tone_stream(hi2s, 500, 100, 1);
+  i2s_silence(hi2s, 50 * 32);                 // 50 ms gap
+  tone_stream(hi2s, 400, 100, 1);
+}
+
+/* play a 16 kHz PCM sound, or the generated error beeps if pcm == NULL */
+void play_sound(const int16_t *pcm, size_t n) {
+  HAL_StatusTypeDef st = HAL_OK;
+
+  /* 1. amps quiet, ADC off the bus */
+  st |= tas_both_state(TAS_STATE_MUTE | TAS_STATE_HIZ);
+  HAL_Delay(6);
+  stop_adc();
+  HAL_I2S_DeInit(&hi2s1);
+
+  /* 2. MCU becomes I2S master */
+  hi2s1.Instance = SPI1;
+  hi2s1.Init.Mode = I2S_MODE_MASTER_TX;
+  hi2s1.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s1.Init.DataFormat = I2S_DATAFORMAT_16B_EXTENDED;
+  hi2s1.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
+  hi2s1.Init.AudioFreq = I2S_AUDIOFREQ_32K;
+  hi2s1.Init.CPOL = I2S_CPOL_LOW;
+  if (HAL_I2S_Init(&hi2s1) != HAL_OK)
+    Error_Handler();
+
+  /* 3. start the clocks with silence, let the TAS lock (~20 ms) */
+  i2s_silence(&hi2s1, 640);                   // 640 frames = 20 ms at 32 kHz
+
+  /* 4. play, never quieter than VOL_SOUND_MIN so feedback stays audible */
+  st |= tas_both_volume(vol_code > VOL_SOUND_MIN ? VOL_SOUND_MIN : vol_code);
+  st |= tas_both_state(TAS_STATE_PLAY);
+  st |= tas_both_clear_faults();
+  if (pcm)
+    sound_stream(&hi2s1, pcm, n);
+  else
+    error_stream(&hi2s1);
+  // sine_play(&hi2s1, 500);                  // 0.5 s test tone
+  i2s_silence(&hi2s1, 160);                   // 5 ms tail so the last sample isn't cut
+
+  /* 5. back to the ADC, but only if aux is selected */
+  st |= tas_both_state(TAS_STATE_MUTE | TAS_STATE_HIZ);
+  HAL_Delay(6);
+  HAL_I2S_DeInit(&hi2s1);                     // pins back to high-Z
+  st |= tas_both_volume(vol_code);
+  check_aux();                                // ADC + amps on or off
+
+  if (st != HAL_OK)
+    Error_Handler();
+}
+
+static void volume_step(int step) {
+  int v = vol_code + step;
+  if (v < VOL_MAX || v > VOL_MIN) {
+    play_sound(ERROR_SOUND);
+    return;
+  }
+  vol_code = (uint8_t)v;
+  if (tas_both_volume(vol_code) != HAL_OK)
+    Error_Handler();
+}
+
+void volume_up(void) { volume_step(-VOL_STEP); }  /* lower code = louder */
+void volume_down(void) { volume_step(VOL_STEP); }
+
+/* Wait until BTN_ON_OFF is released and has stopped bouncing, then drop every
+ * button event collected so far, so nothing fires right after the switch. */
+static void buttons_settle(void) {
+  while (HAL_GPIO_ReadPin(BTN_ON_OFF_GPIO_Port, BTN_ON_OFF_Pin) == GPIO_PIN_RESET) {
+  }
+  HAL_Delay(50);
+  for (uint8_t i = 0; i < 5; i++)
+    swPending[i] = 0;
+}
+
+/* Stop 1 is the deepest mode that keeps RAM and wakes from any EXTI line.
+ * Standby/Shutdown only wake from WKUP pins, and BTN_ON_OFF (PA15) is not one. */
+void mcu_sleep(void) {
+  play_sound(SOUND(switch_off_s));
+  audio_set(0);
+  tas_pdn(false); /* amps fully off */
+  HAL_GPIO_WritePin(GPIOF, LED1_Pin | LED2_Pin, GPIO_PIN_RESET);
+  buttons_settle();
+
+  uint32_t imr = EXTI->IMR1;
+  EXTI->IMR1 = imr & BTN_ON_OFF_Pin; /* only BTN_ON_OFF (EXTI line 15) may wake us */
+  do {
+    HAL_SuspendTick();
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+    HAL_ResumeTick();
+    SystemClock_Config(); /* Stop leaves the MCU on HSI16, PLL off */
+  } while (!swPending[BTN_ON_OFF]);
+  __HAL_GPIO_EXTI_CLEAR_IT(0xFFFF); /* edges on masked lines while asleep */
+  EXTI->IMR1 = imr;
+
+  buttons_settle();
+  tas_startup(); /* PDN cycle, full TAS config, volume */
+  play_sound(SOUND(switch_on_s)); /* ends with check_aux() */
+}
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
   /* USER CODE BEGIN 1 */
 
@@ -467,8 +692,7 @@ int main(void) {
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
-   */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -484,7 +708,6 @@ int main(void) {
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_I2S1_Init();
@@ -511,12 +734,9 @@ int main(void) {
   /* USER CODE BEGIN WHILE */
   while (1) {
 
-    if (swLeftPending &&
-        (HAL_GetTick() - swLeftLastEdge) > 30) // 30 ms with no further edges
-    {
-      swLeftPending = 0;
-      check_aux();
-    }
+    
+
+    handle_inputs();
     // if (HAL_GetTick() - last_poll >= 100) {
     //     last_poll = HAL_GetTick();
     //     if (soundbar_dsp_poll(&fl, &fr)) {
@@ -534,27 +754,28 @@ int main(void) {
     // }
   }
 
-  /* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
-  /* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
@@ -566,29 +787,32 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType =
-      RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
     Error_Handler();
   }
 }
 
 /**
- * @brief ADC1 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_ADC1_Init(void) {
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
 
   /* USER CODE BEGIN ADC1_Init 0 */
 
@@ -600,9 +824,8 @@ static void MX_ADC1_Init(void) {
 
   /* USER CODE END ADC1_Init 1 */
 
-  /** Configure the global features of the ADC (Clock, Resolution, Data
-   * Alignment and number of conversion)
-   */
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
@@ -622,29 +845,33 @@ static void MX_ADC1_Init(void) {
   hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_1CYCLE_5;
   hadc1.Init.OversamplingMode = DISABLE;
   hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK) {
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Configure Regular Channel
-   */
+  */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
     Error_Handler();
   }
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
- * @brief I2C1 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_I2C1_Init(void) {
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
 
   /* USER CODE BEGIN I2C1_Init 0 */
 
@@ -662,32 +889,37 @@ static void MX_I2C1_Init(void) {
   hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Configure Analogue filter
-   */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK) {
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Configure Digital filter
-   */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) {
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
     Error_Handler();
   }
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
 }
 
 /**
- * @brief I2C2 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_I2C2_Init(void) {
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C2_Init(void)
+{
 
   /* USER CODE BEGIN I2C2_Init 0 */
 
@@ -705,32 +937,37 @@ static void MX_I2C2_Init(void) {
   hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
   hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c2) != HAL_OK) {
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Configure Analogue filter
-   */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK) {
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Configure Digital filter
-   */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK) {
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
+  {
     Error_Handler();
   }
   /* USER CODE BEGIN I2C2_Init 2 */
 
   /* USER CODE END I2C2_Init 2 */
+
 }
 
 /**
- * @brief I2S1 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_I2S1_Init(void) {
+  * @brief I2S1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2S1_Init(void)
+{
 
   /* USER CODE BEGIN I2S1_Init 0 */
 
@@ -746,20 +983,23 @@ static void MX_I2S1_Init(void) {
   hi2s1.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
   hi2s1.Init.AudioFreq = I2S_AUDIOFREQ_48K;
   hi2s1.Init.CPOL = I2S_CPOL_LOW;
-  if (HAL_I2S_Init(&hi2s1) != HAL_OK) {
+  if (HAL_I2S_Init(&hi2s1) != HAL_OK)
+  {
     Error_Handler();
   }
   /* USER CODE BEGIN I2S1_Init 2 */
 
   /* USER CODE END I2S1_Init 2 */
+
 }
 
 /**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_USART1_UART_Init(void) {
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
 
   /* USER CODE BEGIN USART1_Init 0 */
 
@@ -779,31 +1019,35 @@ static void MX_USART1_UART_Init(void) {
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart1) != HAL_OK) {
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) !=
-      HAL_OK) {
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) !=
-      HAL_OK) {
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK) {
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
 
   /* USER CODE END USART1_Init 2 */
+
 }
 
 /**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_USART2_UART_Init(void) {
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
 
   /* USER CODE BEGIN USART2_Init 0 */
 
@@ -823,34 +1067,23 @@ static void MX_USART2_UART_Init(void) {
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK) {
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
 }
 
 /**
- * Enable DMA controller clock
- */
-static void MX_DMA_Init(void) {
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-}
-
-/**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
-static void MX_GPIO_Init(void) {
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
@@ -863,7 +1096,7 @@ static void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOF, LED1_Pin | LED2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOF, LED1_Pin|LED2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(BT_EN_GPIO_Port, BT_EN_Pin, GPIO_PIN_RESET);
@@ -875,7 +1108,7 @@ static void MX_GPIO_Init(void) {
   HAL_GPIO_WritePin(ADC_MASTER_GPIO_Port, ADC_MASTER_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : LED1_Pin LED2_Pin */
-  GPIO_InitStruct.Pin = LED1_Pin | LED2_Pin;
+  GPIO_InitStruct.Pin = LED1_Pin|LED2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -914,14 +1147,14 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(ADC_MASTER_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : BTN4_Pin */
-  GPIO_InitStruct.Pin = BTN4_Pin;
+  /*Configure GPIO pin : BTN_ON_OFF_Pin */
+  GPIO_InitStruct.Pin = BTN_ON_OFF_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(BTN4_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(BTN_ON_OFF_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : BTN3_Pin BTN2_Pin BTN1_Pin */
-  GPIO_InitStruct.Pin = BTN3_Pin | BTN2_Pin | BTN1_Pin;
+  /*Configure GPIO pins : BTN_VOL_UP_Pin BTN_VOL_DOWN_Pin BTN_SOURCE_Pin */
+  GPIO_InitStruct.Pin = BTN_VOL_UP_Pin|BTN_VOL_DOWN_Pin|BTN_SOURCE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
@@ -942,18 +1175,44 @@ static void MX_GPIO_Init(void) {
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin) {
-  if (GPIO_Pin == SW_LEFT_Pin) {
-    swLeftLastEdge = HAL_GetTick();
-    swLeftPending = 1;
+
+
+uint8_t getIndex(uint16_t GPIO_Pin) {
+  uint8_t index = 0;
+  switch (GPIO_Pin) {
+    case SW_LEFT_Pin:
+      index = SW_LEFT_INDEX;
+      break;
+    case BTN_SOURCE_Pin:
+      index = BTN_SOURCE;
+      break;
+    case BTN_VOL_DOWN_Pin:
+      index = BTN_VOLUME_DOWN;
+      break;
+    case BTN_VOL_UP_Pin:
+      index = BTN_VOLUME_UP;
+      break;
+    case BTN_ON_OFF_Pin:
+      index = BTN_ON_OFF;
+      break;
+    default:
+      return 0xFF; // Invalid pin
   }
+  return index;
+}
+
+void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin) {
+  uint8_t index = getIndex(GPIO_Pin);
+  if (index == 0xFF) return;
+  swLastEdge[index] = HAL_GetTick();
+  swPending[index] = 1;
 }
 
 void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin) {
-  if (GPIO_Pin == SW_LEFT_Pin) {
-    swLeftLastEdge = HAL_GetTick();
-    swLeftPending = 1;
-  }
+  uint8_t index = getIndex(GPIO_Pin);
+  if (index == 0xFF) return;
+  swLastEdge[index] = HAL_GetTick();
+  swPending[index] = 1;
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
@@ -962,10 +1221,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
@@ -977,13 +1237,14 @@ void Error_Handler(void) {
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,

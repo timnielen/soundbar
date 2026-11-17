@@ -74,18 +74,18 @@ void Error_Handler(void);
 #define SW_LEFT_EXTI_IRQn EXTI4_15_IRQn
 #define ADC_MASTER_Pin GPIO_PIN_13
 #define ADC_MASTER_GPIO_Port GPIOB
-#define BTN4_Pin GPIO_PIN_15
-#define BTN4_GPIO_Port GPIOA
-#define BTN4_EXTI_IRQn EXTI4_15_IRQn
-#define BTN3_Pin GPIO_PIN_0
-#define BTN3_GPIO_Port GPIOD
-#define BTN3_EXTI_IRQn EXTI0_1_IRQn
-#define BTN2_Pin GPIO_PIN_1
-#define BTN2_GPIO_Port GPIOD
-#define BTN2_EXTI_IRQn EXTI0_1_IRQn
-#define BTN1_Pin GPIO_PIN_2
-#define BTN1_GPIO_Port GPIOD
-#define BTN1_EXTI_IRQn EXTI2_3_IRQn
+#define BTN_ON_OFF_Pin GPIO_PIN_15
+#define BTN_ON_OFF_GPIO_Port GPIOA
+#define BTN_ON_OFF_EXTI_IRQn EXTI4_15_IRQn
+#define BTN_VOL_UP_Pin GPIO_PIN_0
+#define BTN_VOL_UP_GPIO_Port GPIOD
+#define BTN_VOL_UP_EXTI_IRQn EXTI0_1_IRQn
+#define BTN_VOL_DOWN_Pin GPIO_PIN_1
+#define BTN_VOL_DOWN_GPIO_Port GPIOD
+#define BTN_VOL_DOWN_EXTI_IRQn EXTI0_1_IRQn
+#define BTN_SOURCE_Pin GPIO_PIN_2
+#define BTN_SOURCE_GPIO_Port GPIOD
+#define BTN_SOURCE_EXTI_IRQn EXTI2_3_IRQn
 
 /* USER CODE BEGIN Private defines */
 
@@ -94,6 +94,12 @@ void Error_Handler(void);
 
 HAL_StatusTypeDef tas_deep_sleep(uint8_t addr);
 HAL_StatusTypeDef tas_play(uint8_t addr);
+
+void play_sound(const int16_t *pcm, size_t n);
+void audio_set(uint8_t on); /* PCM1808 + both TAS on/off */
+void volume_up(void);
+void volume_down(void);
+void mcu_sleep(void); /* switch-off sound, Stop 1 until BTN_ON_OFF, switch-on sound */
 
 /* USER CODE END Private defines */
 
